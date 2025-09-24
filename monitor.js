@@ -1,4 +1,4 @@
-// monitor.js - 2x2 grid version with SQLite storage, aggregation, and UTC+3 timezone
+// monitor.js - 4x4 grid version with SQLite storage, aggregation, and UTC+3 timezone
 const express = require("express");
 const { exec } = require("child_process");
 const util = require("util");
@@ -62,6 +62,15 @@ let inTraffic2 = [];
 let outTraffic2 = [];
 let cpuUsage = [];
 let memUsed = [];
+
+// For aggregated data
+let aggTimes = [];
+let aggInTraffic1 = [];
+let aggOutTraffic1 = [];
+let aggInTraffic2 = [];
+let aggOutTraffic2 = [];
+let aggCpuUsage = [];
+let aggMemUsed = [];
 
 // --- HELPER: Get current time in UTC+3 with 24h format ---
 function getCurrentTime() {
@@ -221,6 +230,33 @@ async function loadCurrentData() {
     });
 }
 
+// Load aggregated data points from database (latest 150 aggregated records)
+async function loadAggregatedData() {
+    return new Promise((resolve, reject) => {
+        // Get aggregated records (most recent 150)
+        db.all(`SELECT * FROM metrics WHERE is_aggregated = 1 ORDER BY timestamp DESC LIMIT 150`, (err, rows) => {
+            if (err) {
+                console.error(`[${getCurrentTime()}] [DB] Error loading aggregated `, err.message);
+                return reject(err);
+            }
+
+            // Reverse to get chronological order (oldest first)
+            rows.reverse();
+
+            // Format timestamps for display (UTC+3, 24h format)
+            aggTimes = rows.map(row => formatTime(row.timestamp));
+            aggInTraffic1 = rows.map(row => row.in1);
+            aggOutTraffic1 = rows.map(row => row.out1);
+            aggInTraffic2 = rows.map(row => row.in2);
+            aggOutTraffic2 = rows.map(row => row.out2);
+            aggCpuUsage = rows.map(row => row.cpu);
+            aggMemUsed = rows.map(row => row.mem);
+
+            resolve();
+        });
+    });
+}
+
 // Main polling function
 async function pollData() {
     const [inVal1, outVal1, inVal2, outVal2, cpuVal, memVal] = await Promise.all([
@@ -260,11 +296,23 @@ async function pollData() {
     cpuUsage.push(cpuVal != null ? parseInt(cpuVal) : 0);
     memUsed.push(memVal != null ? parseInt(memVal) : 0);
 
+    // Keep only the latest MAX_DATA_POINTS
+    if (times.length > MAX_DATA_POINTS) {
+        times.shift();
+        inTraffic1.shift();
+        outTraffic1.shift();
+        inTraffic2.shift();
+        outTraffic2.shift();
+        cpuUsage.shift();
+        memUsed.shift();
+    }
+
     // Check if we need to aggregate
     if (times.length >= MAX_DATA_POINTS) {
         console.log(`[${getCurrentTime()}] [AGG] Reached ${MAX_DATA_POINTS} points, starting aggregation...`);
         await aggregateData();
         await loadCurrentData(); // Reload current data after aggregation
+        await loadAggregatedData(); // Reload aggregated data
     }
 
     console.log(`[${getCurrentTime()}] [POLL] Intf1: In=${inMbps1.toFixed(3)}Mb/s, Out=${outMbps1.toFixed(3)}Mb/s | Intf2: In=${inMbps2.toFixed(3)}Mb/s, Out=${outMbps2.toFixed(3)}Mb/s | CPU: ${cpuVal || 'N/A'}% | MEM: ${memVal || 'N/A'}MB`);
@@ -277,7 +325,9 @@ async function start() {
     // Load existing data on startup
     try {
         await loadCurrentData();
+        await loadAggregatedData();
         console.log(`[${getCurrentTime()}] [INIT] Loaded ${times.length} data points from database`);
+        console.log(`[${getCurrentTime()}] [INIT] Loaded ${aggTimes.length} aggregated data points from database`);
     } catch (error) {
         console.error(`[${getCurrentTime()}] [INIT] Error loading initial `, error.message);
     }
@@ -327,10 +377,18 @@ app.get("/", (req, res) => {
       margin-bottom: 15px;
       font-style: italic;
     }
+    .section-title {
+      text-align: center;
+      font-size: 1.5em;
+      margin: 30px 0 10px 0;
+      color: #333;
+    }
   </style>
 </head>
 <body>
   <div class="timezone-info">All times displayed in a server timezone</div>
+  
+  <div class="section-title">Latest Data (150 points x 5 sec)</div>
   <div class="chart-container">
     <div>
       <h2>Interface A (Mb/s)</h2>
@@ -358,13 +416,41 @@ app.get("/", (req, res) => {
     </div>
   </div>
 
+  <div class="section-title">Historical Aggregated Data (150 points x 5 sec)</div>
+  <div class="chart-container">
+    <div>
+      <h2>Interface A (Mb/s)</h2>
+      <div class="chart-wrapper">
+        <canvas id="aggTrafficChart1"></canvas>
+      </div>
+    </div>
+    <div>
+      <h2>Interface B (Mb/s)</h2>
+      <div class="chart-wrapper">
+        <canvas id="aggTrafficChart2"></canvas>
+      </div>
+    </div>
+    <div>
+      <h2>CPU Usage (%)</h2>
+      <div class="chart-wrapper">
+        <canvas id="aggCpuChart"></canvas>
+      </div>
+    </div>
+    <div>
+      <h2>Memory Used</h2>
+      <div class="chart-wrapper">
+        <canvas id="aggMemChart"></canvas>
+      </div>
+    </div>
+  </div>
+
   <script>
     async function fetchData() {
         const res = await fetch('/data');
         return await res.json();
     }
 
-    // Initialize all charts
+    // Initialize all charts for latest data
     const trafficCtx1 = document.getElementById('trafficChart1').getContext('2d');
     const trafficCtx2 = document.getElementById('trafficChart2').getContext('2d');
     const cpuCtx = document.getElementById('cpuChart').getContext('2d');
@@ -372,7 +458,7 @@ app.get("/", (req, res) => {
 
     const trafficChart1 = new Chart(trafficCtx1, {
         type: 'line',
-        data: { labels: [], datasets: [  // ✅ FIXED: added "data:"
+        data: { labels: [], datasets: [
             { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
             { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
         ]},
@@ -403,7 +489,7 @@ app.get("/", (req, res) => {
 
     const trafficChart2 = new Chart(trafficCtx2, {
         type: 'line',
-        data: { labels: [], datasets: [  // ✅ FIXED
+        data: { labels: [], datasets: [
             { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
             { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
         ]},
@@ -434,7 +520,7 @@ app.get("/", (req, res) => {
 
     const cpuChart = new Chart(cpuCtx, {
         type: 'line',
-        data: { labels: [], datasets: [  // ✅ FIXED
+        data: { labels: [], datasets: [
             { label: 'CPU %', data: [], borderColor: 'green', fill: false }
         ]},
         options: {
@@ -455,7 +541,117 @@ app.get("/", (req, res) => {
 
     const memChart = new Chart(memCtx, {
         type: 'line',
-        data: { labels: [], datasets: [  // ✅ FIXED
+        data: { labels: [], datasets: [
+            { label: 'Memory Used', data: [], borderColor: 'orange', fill: false }
+        ]},
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: { 
+                    display: true,
+                    ticks: {
+                        maxRotation: 0,
+                        autoSkip: true
+                    }
+                },
+                y: { beginAtZero: true }
+            }
+        }
+    });
+
+    // Initialize all charts for aggregated data
+    const aggTrafficCtx1 = document.getElementById('aggTrafficChart1').getContext('2d');
+    const aggTrafficCtx2 = document.getElementById('aggTrafficChart2').getContext('2d');
+    const aggCpuCtx = document.getElementById('aggCpuChart').getContext('2d');
+    const aggMemCtx = document.getElementById('aggMemChart').getContext('2d');
+
+    const aggTrafficChart1 = new Chart(aggTrafficCtx1, {
+        type: 'line',
+        data: { labels: [], datasets: [
+            { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
+            { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
+        ]},
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: { 
+                    display: true,
+                    ticks: {
+                        maxRotation: 0,
+                        autoSkip: true
+                    }
+                },
+                y: { beginAtZero: true }
+            },
+            plugins: {
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            return context.dataset.label + ': ' + context.parsed.y.toFixed(3) + ' Mb/s';
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    const aggTrafficChart2 = new Chart(aggTrafficCtx2, {
+        type: 'line',
+        data: { labels: [], datasets: [
+            { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
+            { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
+        ]},
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: { 
+                    display: true,
+                    ticks: {
+                        maxRotation: 0,
+                        autoSkip: true
+                    }
+                },
+                y: { beginAtZero: true }
+            },
+            plugins: {
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            return context.dataset.label + ': ' + context.parsed.y.toFixed(3) + ' Mb/s';
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    const aggCpuChart = new Chart(aggCpuCtx, {
+        type: 'line',
+        data: { labels: [], datasets: [
+            { label: 'CPU %', data: [], borderColor: 'green', fill: false }
+        ]},
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: { 
+                    display: true,
+                    ticks: {
+                        maxRotation: 0,
+                        autoSkip: true
+                    }
+                },
+                y: { beginAtZero: true, max: 100 }
+            }
+        }
+    });
+
+    const aggMemChart = new Chart(aggMemCtx, {
+        type: 'line',
+        data: { labels: [], datasets: [
             { label: 'Memory Used', data: [], borderColor: 'orange', fill: false }
         ]},
         options: {
@@ -477,6 +673,7 @@ app.get("/", (req, res) => {
     async function updateCharts() {
         const data = await fetchData();
 
+        // Update latest data charts
         trafficChart1.data.labels = data.times;
         trafficChart1.data.datasets[0].data = data.inTraffic1;
         trafficChart1.data.datasets[1].data = data.outTraffic1;
@@ -494,6 +691,25 @@ app.get("/", (req, res) => {
         memChart.data.labels = data.times;
         memChart.data.datasets[0].data = data.memUsed;
         memChart.update();
+
+        // Update aggregated data charts
+        aggTrafficChart1.data.labels = data.aggTimes;
+        aggTrafficChart1.data.datasets[0].data = data.aggInTraffic1;
+        aggTrafficChart1.data.datasets[1].data = data.aggOutTraffic1;
+        aggTrafficChart1.update();
+
+        aggTrafficChart2.data.labels = data.aggTimes;
+        aggTrafficChart2.data.datasets[0].data = data.aggInTraffic2;
+        aggTrafficChart2.data.datasets[1].data = data.aggOutTraffic2;
+        aggTrafficChart2.update();
+
+        aggCpuChart.data.labels = data.aggTimes;
+        aggCpuChart.data.datasets[0].data = data.aggCpuUsage;
+        aggCpuChart.update();
+
+        aggMemChart.data.labels = data.aggTimes;
+        aggMemChart.data.datasets[0].data = data.aggMemUsed;
+        aggMemChart.update();
     }
 
     setInterval(updateCharts, ${POLL_INTERVAL_SECONDS * 1000});
@@ -508,6 +724,7 @@ app.get("/data", async (req, res) => {
     // Always load fresh data from DB to ensure consistency
     try {
         await loadCurrentData();
+        await loadAggregatedData();
         res.json({
             times,
             inTraffic1,
@@ -515,7 +732,14 @@ app.get("/data", async (req, res) => {
             inTraffic2,
             outTraffic2,
             cpuUsage,
-            memUsed
+            memUsed,
+            aggTimes,
+            aggInTraffic1,
+            aggOutTraffic1,
+            aggInTraffic2,
+            aggOutTraffic2,
+            aggCpuUsage,
+            aggMemUsed
         });
     } catch (error) {
         console.error(`[${getCurrentTime()}] [API] Error loading `, error.message);
