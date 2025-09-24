@@ -21,6 +21,7 @@ const OID_MEMUSED = "1.3.6.1.4.1.23668.8107.1.6.7.0"; // Counter64
 
 const POLL_INTERVAL_SECONDS = 5;
 const MAX_DATA_POINTS = 150; // 150 points * 5 sec = 12.5 minutes
+const MAX_AGGREGATED_POINTS = 150; // Keep only last 150 aggregated points
 const TIMEZONE = "UTC+3";
 
 // --- DATABASE SETUP ---
@@ -71,6 +72,9 @@ let aggInTraffic2 = [];
 let aggOutTraffic2 = [];
 let aggCpuUsage = [];
 let aggMemUsed = [];
+
+// Track aggregation state
+let aggregationCount = 0;
 
 // --- HELPER: Get current time in UTC+3 with 24h format ---
 function getCurrentTime() {
@@ -193,6 +197,27 @@ async function aggregateData() {
                             console.error(`[${getCurrentTime()}] [DB] Error marking records as aggregated:`, err.message);
                         } else {
                             console.log(`[${getCurrentTime()}] [AGG] Aggregated ${rows.length} records into 1 point`);
+                            
+                            // Add to aggregated data arrays
+                            const formattedTime = formatTime(latestTimestamp);
+                            aggTimes.push(formattedTime);
+                            aggInTraffic1.push(avgIn1);
+                            aggOutTraffic1.push(avgOut1);
+                            aggInTraffic2.push(avgIn2);
+                            aggOutTraffic2.push(avgOut2);
+                            aggCpuUsage.push(avgCpu);
+                            aggMemUsed.push(avgMem);
+                            
+                            // Limit aggregated arrays to MAX_AGGREGATED_POINTS
+                            if (aggTimes.length > MAX_AGGREGATED_POINTS) {
+                                aggTimes.shift();
+                                aggInTraffic1.shift();
+                                aggOutTraffic1.shift();
+                                aggInTraffic2.shift();
+                                aggOutTraffic2.shift();
+                                aggCpuUsage.shift();
+                                aggMemUsed.shift();
+                            }
                         }
                         resolve();
                     });
@@ -230,11 +255,11 @@ async function loadCurrentData() {
     });
 }
 
-// Load aggregated data points from database (latest 150 aggregated records)
+// Load aggregated data points from database (latest MAX_AGGREGATED_POINTS aggregated records)
 async function loadAggregatedData() {
     return new Promise((resolve, reject) => {
-        // Get aggregated records (most recent 150)
-        db.all(`SELECT * FROM metrics WHERE is_aggregated = 1 ORDER BY timestamp DESC LIMIT 150`, (err, rows) => {
+        // Get aggregated records (most recent MAX_AGGREGATED_POINTS)
+        db.all(`SELECT * FROM metrics WHERE is_aggregated = 1 ORDER BY timestamp DESC LIMIT ${MAX_AGGREGATED_POINTS}`, (err, rows) => {
             if (err) {
                 console.error(`[${getCurrentTime()}] [DB] Error loading aggregated `, err.message);
                 return reject(err);
@@ -307,12 +332,11 @@ async function pollData() {
         memUsed.shift();
     }
 
-    // Check if we need to aggregate
-    if (times.length >= MAX_DATA_POINTS) {
+    // Check if we need to aggregate (every MAX_DATA_POINTS collected)
+    if (times.length === MAX_DATA_POINTS) {
         console.log(`[${getCurrentTime()}] [AGG] Reached ${MAX_DATA_POINTS} points, starting aggregation...`);
         await aggregateData();
         await loadCurrentData(); // Reload current data after aggregation
-        await loadAggregatedData(); // Reload aggregated data
     }
 
     console.log(`[${getCurrentTime()}] [POLL] Intf1: In=${inMbps1.toFixed(3)}Mb/s, Out=${outMbps1.toFixed(3)}Mb/s | Intf2: In=${inMbps2.toFixed(3)}Mb/s, Out=${outMbps2.toFixed(3)}Mb/s | CPU: ${cpuVal || 'N/A'}% | MEM: ${memVal || 'N/A'}MB`);
@@ -388,7 +412,7 @@ app.get("/", (req, res) => {
 <body>
   <div class="timezone-info">All times displayed in a server timezone</div>
   
-  <div class="section-title">Latest Data (150 points x 5 sec)</div>
+  <div class="section-title">Latest Data</div>
   <div class="chart-container">
     <div>
       <h2>Interface A (Mb/s)</h2>
@@ -416,7 +440,7 @@ app.get("/", (req, res) => {
     </div>
   </div>
 
-  <div class="section-title">Historical Aggregated Data (150 points x 5 sec)</div>
+  <div class="section-title">Historical Aggregated Data</div>
   <div class="chart-container">
     <div>
       <h2>Interface A (Mb/s)</h2>
@@ -721,30 +745,23 @@ app.get("/", (req, res) => {
 });
 
 app.get("/data", async (req, res) => {
-    // Always load fresh data from DB to ensure consistency
-    try {
-        await loadCurrentData();
-        await loadAggregatedData();
-        res.json({
-            times,
-            inTraffic1,
-            outTraffic1,
-            inTraffic2,
-            outTraffic2,
-            cpuUsage,
-            memUsed,
-            aggTimes,
-            aggInTraffic1,
-            aggOutTraffic1,
-            aggInTraffic2,
-            aggOutTraffic2,
-            aggCpuUsage,
-            aggMemUsed
-        });
-    } catch (error) {
-        console.error(`[${getCurrentTime()}] [API] Error loading `, error.message);
-        res.status(500).json({ error: "Failed to load data" });
-    }
+    // Always return current in-memory data
+    res.json({
+        times,
+        inTraffic1,
+        outTraffic1,
+        inTraffic2,
+        outTraffic2,
+        cpuUsage,
+        memUsed,
+        aggTimes,
+        aggInTraffic1,
+        aggOutTraffic1,
+        aggInTraffic2,
+        aggOutTraffic2,
+        aggCpuUsage,
+        aggMemUsed
+    });
 });
 
 // Start everything
