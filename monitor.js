@@ -10,11 +10,11 @@ const SNMP_PORT = 161;
 const SNMP_COMMUNITY = "comm1";
 
 // Use the original OIDs from your snmpwalk
-const OID_IN1 = "1.3.6.1.4.1.23668.8107.2.1.1.110.13";
-const OID_OUT1 = "1.3.6.1.4.1.23668.8107.2.1.1.121.13";
-const OID_IN2 = "1.3.6.1.4.1.23668.8107.2.1.1.110.14";
-const OID_OUT2 = "1.3.6.1.4.1.23668.8107.2.1.1.121.14";
-const OID_CPU = "1.3.6.1.4.1.23668.8107.1.6.1.0";
+const OID_IN1 = "1.3.6.1.4.1.23668.8107.2.1.1.110.13";  // interface a
+const OID_OUT1 = "1.3.6.1.4.1.23668.8107.2.1.1.121.13"; // interface a
+const OID_IN2 = "1.3.6.1.4.1.23668.8107.2.1.1.110.14"; // interface b
+const OID_OUT2 = "1.3.6.1.4.1.23668.8107.2.1.1.121.14"; // interface b
+const OID_CPU = "1.3.6.1.4.1.23668.8107.1.6.1.0"; // CPU counter32
 const OID_MEMUSED = "1.3.6.1.4.1.23668.8107.1.6.7.0"; // Counter64
 
 const POLL_INTERVAL_SECONDS = 5;
