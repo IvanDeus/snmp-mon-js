@@ -1,5 +1,5 @@
 # snmp-mon-js
-Simple 4 graph SNMP Monitoring
+Simple 4 graph SNMP Monitoring. Will collect and store data into SQLite and show up to last 25 hours. 
 ## setup
 
 git clone 
