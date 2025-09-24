@@ -148,7 +148,7 @@ snmp-mon-js/
 3. Modify the database schema and saving logic
 4. Update the web interface charts
 
-[ivan deus] 2025
+2025 [ivan deus]
 
 ---
 
