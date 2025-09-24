@@ -295,8 +295,9 @@ app.get("/", (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-  <title>SNMP Monitor (UTC+3)</title>
+  <title>SNMP Monitor</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="icon" href="data:,"> <!-- Prevents 404 for favicon -->
   <style>
     body { font-family: sans-serif; margin: 20px; }
     .chart-container {
@@ -329,7 +330,7 @@ app.get("/", (req, res) => {
   </style>
 </head>
 <body>
-  <div class="timezone-info">All times displayed in UTC+3 (24-hour format)</div>
+  <div class="timezone-info">All times displayed in a server timezone</div>
   <div class="chart-container">
     <div>
       <h2>Interface A (Mb/s)</h2>
@@ -371,9 +372,9 @@ app.get("/", (req, res) => {
 
     const trafficChart1 = new Chart(trafficCtx1, {
         type: 'line',
-         { labels: [], datasets: [
-            { label: 'In Mb/s',  [], borderColor: 'blue', fill: false },
-            { label: 'Out Mb/s',  [], borderColor: 'red', fill: false }
+        data: { labels: [], datasets: [  // ✅ FIXED: added "data:"
+            { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
+            { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
         ]},
         options: {
             responsive: true,
@@ -402,9 +403,9 @@ app.get("/", (req, res) => {
 
     const trafficChart2 = new Chart(trafficCtx2, {
         type: 'line',
-        data: { labels: [], datasets: [
-            { label: 'In Mb/s',  [], borderColor: 'blue', fill: false },
-            { label: 'Out Mb/s',  [], borderColor: 'red', fill: false }
+        data: { labels: [], datasets: [  // ✅ FIXED
+            { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
+            { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
         ]},
         options: {
             responsive: true,
@@ -433,8 +434,8 @@ app.get("/", (req, res) => {
 
     const cpuChart = new Chart(cpuCtx, {
         type: 'line',
-         { labels: [], datasets: [
-            { label: 'CPU %',  [], borderColor: 'green', fill: false }
+        data: { labels: [], datasets: [  // ✅ FIXED
+            { label: 'CPU %', data: [], borderColor: 'green', fill: false }
         ]},
         options: {
             responsive: true,
@@ -454,8 +455,8 @@ app.get("/", (req, res) => {
 
     const memChart = new Chart(memCtx, {
         type: 'line',
-         { labels: [], datasets: [
-            { label: 'Memory Used',  [], borderColor: 'orange', fill: false }
+        data: { labels: [], datasets: [  // ✅ FIXED
+            { label: 'Memory Used', data: [], borderColor: 'orange', fill: false }
         ]},
         options: {
             responsive: true,
@@ -476,24 +477,20 @@ app.get("/", (req, res) => {
     async function updateCharts() {
         const data = await fetchData();
 
-        // Update Interface 1 chart
         trafficChart1.data.labels = data.times;
         trafficChart1.data.datasets[0].data = data.inTraffic1;
         trafficChart1.data.datasets[1].data = data.outTraffic1;
         trafficChart1.update();
 
-        // Update Interface 2 chart
         trafficChart2.data.labels = data.times;
         trafficChart2.data.datasets[0].data = data.inTraffic2;
         trafficChart2.data.datasets[1].data = data.outTraffic2;
         trafficChart2.update();
 
-        // Update CPU chart
         cpuChart.data.labels = data.times;
         cpuChart.data.datasets[0].data = data.cpuUsage;
         cpuChart.update();
 
-        // Update Memory chart
         memChart.data.labels = data.times;
         memChart.data.datasets[0].data = data.memUsed;
         memChart.update();
