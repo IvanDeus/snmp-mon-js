@@ -1,9 +1,11 @@
-// monitor.js - 4x4 grid version with SQLite storage, aggregation, and UTC+3 timezone
+// monitor-command-line.js - Enhanced with SQLite historical data
 const express = require("express");
 const { exec } = require("child_process");
 const util = require("util");
 const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
+const fs = require("fs");
+
 const execAsync = util.promisify(exec);
 
 // --- SETTINGS ---
@@ -12,48 +14,16 @@ const SNMP_PORT = 161;
 const SNMP_COMMUNITY = "comm1";
 
 // Use the original OIDs from your snmpwalk
-const OID_IN1 = "1.3.6.1.4.1.23668.8107.2.1.1.110.13";  // interface a
-const OID_OUT1 = "1.3.6.1.4.1.23668.8107.2.1.1.121.13"; // interface a
-const OID_IN2 = "1.3.6.1.4.1.23668.8107.2.1.1.110.14"; // interface b
-const OID_OUT2 = "1.3.6.1.4.1.23668.8107.2.1.1.121.14"; // interface b
-const OID_CPU = "1.3.6.1.4.1.23668.8107.1.6.1.0"; // CPU counter32
+const OID_IN1 = "1.3.6.1.4.1.23668.8107.2.1.1.110.13";
+const OID_OUT1 = "1.3.6.1.4.1.23668.8107.2.1.1.121.13";
+const OID_IN2 = "1.3.6.1.4.1.23668.8107.2.1.1.110.14";
+const OID_OUT2 = "1.3.6.1.4.1.23668.8107.2.1.1.121.14";
+const OID_CPU = "1.3.6.1.4.1.23668.8107.1.6.1.0";
 const OID_MEMUSED = "1.3.6.1.4.1.23668.8107.1.6.7.0"; // Counter64
 
 const POLL_INTERVAL_SECONDS = 5;
-const MAX_DATA_POINTS = 150; // 150 points * 5 sec = 12.5 minutes
-const MAX_AGGREGATED_POINTS = 150; // Keep only last 150 aggregated points
-const TIMEZONE = "UTC+3";
-
-// --- DATABASE SETUP ---
-const DB_PATH = path.join(__dirname, "monitor.db");
-let db;
-
-function initDatabase() {
-    db = new sqlite3.Database(DB_PATH, (err) => {
-        if (err) {
-            console.error(`[${getCurrentTime()}] [DB] Error opening database:`, err.message);
-        } else {
-            console.log(`[${getCurrentTime()}] [DB] Connected to SQLite database`);
-        }
-    });
-
-    // Create table if not exists
-    db.run(`CREATE TABLE IF NOT EXISTS metrics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-        in1 REAL,
-        out1 REAL,
-        in2 REAL,
-        out2 REAL,
-        cpu INTEGER,
-        mem INTEGER,
-        is_aggregated BOOLEAN DEFAULT 0
-    )`, (err) => {
-        if (err) {
-            console.error(`[${getCurrentTime()}] [DB] Error creating table:`, err.message);
-        }
-    });
-}
+const MAX_DATA_POINTS = 150;
+const DB_SAVE_INTERVAL = MAX_DATA_POINTS * 5 * 1000; // Save every MAX_DATA_POINTS * 5 seconds
 
 // --- DATA STORAGE ---
 let times = [];
@@ -64,225 +34,135 @@ let outTraffic2 = [];
 let cpuUsage = [];
 let memUsed = [];
 
-// For aggregated data
-let aggTimes = [];
-let aggInTraffic1 = [];
-let aggOutTraffic1 = [];
-let aggInTraffic2 = [];
-let aggOutTraffic2 = [];
-let aggCpuUsage = [];
-let aggMemUsed = [];
+// --- SQLITE DATABASE ---
+const DB_PATH = path.join(__dirname, 'monitor.db');
+let db;
 
-// Track aggregation state
-let aggregationCount = 0;
+// Initialize database
+function initDatabase() {
+    return new Promise((resolve, reject) => {
+        db = new sqlite3.Database(DB_PATH, (err) => {
+            if (err) {
+                console.error('Error opening database:', err);
+                reject(err);
+                return;
+            }
 
-// --- HELPER: Get current time in UTC+3 with 24h format ---
-function getCurrentTime() {
-    const now = new Date();
-    const utcPlus3 = new Date(now.getTime() + (3 * 60 * 60 * 1000));
-    return utcPlus3.toISOString().replace('T', ' ').substring(0, 19) + ' (UTC+3)';
+            // Create table if it doesn't exist
+            db.run(`
+                CREATE TABLE IF NOT EXISTS historical_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    in_traffic1 REAL,
+                    out_traffic1 REAL,
+                    in_traffic2 REAL,
+                    out_traffic2 REAL,
+                    cpu_usage REAL,
+                    mem_used REAL
+                )
+            `, (err) => {
+                if (err) {
+                    console.error('Error creating table:', err);
+                    reject(err);
+                    return;
+                }
+                console.log('Database initialized successfully');
+                resolve();
+            });
+        });
+    });
 }
 
-// --- HELPER: Format timestamp for display (24h format, UTC+3) ---
-function formatTime(timestamp) {
-    // Convert ISO string to Date object
-    const date = new Date(timestamp);
-    // Add 3 hours for UTC+3
-    const utcPlus3 = new Date(date.getTime() + (3 * 60 * 60 * 1000));
-    // Format as HH:MM:SS (24-hour format)
-    const hours = utcPlus3.getHours().toString().padStart(2, '0');
-    const minutes = utcPlus3.getMinutes().toString().padStart(2, '0');
-    const seconds = utcPlus3.getSeconds().toString().padStart(2, '0');
-    return `${hours}:${minutes}:${seconds}`;
+// Save average data to database
+function saveAverageToDatabase() {
+    if (times.length === 0) return;
+
+    // Calculate averages
+    const avgInTraffic1 = inTraffic1.reduce((a, b) => a + b, 0) / inTraffic1.length;
+    const avgOutTraffic1 = outTraffic1.reduce((a, b) => a + b, 0) / outTraffic1.length;
+    const avgInTraffic2 = inTraffic2.reduce((a, b) => a + b, 0) / inTraffic2.length;
+    const avgOutTraffic2 = outTraffic2.reduce((a, b) => a + b, 0) / outTraffic2.length;
+    const avgCpuUsage = cpuUsage.reduce((a, b) => a + b, 0) / cpuUsage.length;
+    const avgMemUsed = memUsed.reduce((a, b) => a + b, 0) / memUsed.length;
+
+    db.run(`
+        INSERT INTO historical_data 
+        (in_traffic1, out_traffic1, in_traffic2, out_traffic2, cpu_usage, mem_used)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `, [avgInTraffic1, avgOutTraffic1, avgInTraffic2, avgOutTraffic2, avgCpuUsage, avgMemUsed], 
+    (err) => {
+        if (err) {
+            console.error('Error saving to database:', err);
+        } else {
+            console.log(`[${nowTime()}] [DB] Average data saved to database`);
+        }
+    });
+}
+
+// Get historical data from database
+function getHistoricalData(limit = 100) {
+    return new Promise((resolve, reject) => {
+        db.all(`
+            SELECT 
+                datetime(timestamp, 'localtime') as timestamp,
+                in_traffic1,
+                out_traffic1,
+                in_traffic2,
+                out_traffic2,
+                cpu_usage,
+                mem_used
+            FROM historical_data 
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        `, [limit], (err, rows) => {
+            if (err) {
+                reject(err);
+            } else {
+                // Reverse to show chronological order
+                resolve(rows.reverse());
+            }
+        });
+    });
+}
+
+// --- HELPER: format timestamp ---
+function nowTime() {
+    return new Date().toLocaleTimeString();
 }
 
 // Function to get SNMP value using command line
 async function getSnmpValue(oid) {
     try {
         const command = `snmpget -v2c -c ${SNMP_COMMUNITY} ${SNMP_HOST}:${SNMP_PORT} ${oid}`;
-        console.log(`[${getCurrentTime()}] [CMD] Executing: ${command}`);
+        console.log(`[${nowTime()}] [CMD] Executing: ${command}`);
 
         const { stdout, stderr } = await execAsync(command, { timeout: 10000 });
 
         if (stderr) {
-            console.error(`[${getCurrentTime()}] [CMD] Error:`, stderr);
+            console.error(`[${nowTime()}] [CMD] Error:`, stderr);
             return null;
         }
 
         // Parse the output: "OID = Counter64: value" or "OID = INTEGER: value"
         const output = stdout.trim();
-        console.log(`[${getCurrentTime()}] [CMD] Output: ${output}`);
+        console.log(`[${nowTime()}] [CMD] Output: ${output}`);
 
         // Extract the value part
         const match = output.match(/=\s*(?:Counter64|INTEGER|Gauge32|Counter32):\s*(\d+)/i);
         if (match) {
             const value = parseInt(match[1]);
-            console.log(`[${getCurrentTime()}] [CMD] Parsed value: ${value}`);
+            console.log(`[${nowTime()}] [CMD] Parsed value: ${value}`);
             return value;
         } else {
-            console.error(`[${getCurrentTime()}] [CMD] Could not parse value from: ${output}`);
+            console.error(`[${nowTime()}] [CMD] Could not parse value from: ${output}`);
             return null;
         }
     } catch (error) {
-        console.error(`[${getCurrentTime()}] [CMD] Command failed for ${oid}:`, error.message);
+        console.error(`[${nowTime()}] [CMD] Command failed for ${oid}:`, error.message);
         return null;
     }
 }
 
-// Save data point to database
-function saveToDatabase(data) {
-    const stmt = db.prepare(`INSERT INTO metrics (in1, out1, in2, out2, cpu, mem) VALUES (?, ?, ?, ?, ?, ?)`);
-    stmt.run(
-        data.in1,
-        data.out1,
-        data.in2,
-        data.out2,
-        data.cpu,
-        data.mem,
-        (err) => {
-            if (err) {
-                console.error(`[${getCurrentTime()}] [DB] Error inserting `, err.message);
-            }
-        }
-    );
-    stmt.finalize();
-}
-
-// Aggregate data points into averages
-async function aggregateData() {
-    return new Promise((resolve, reject) => {
-        // Get all non-aggregated data points
-        db.all(`SELECT * FROM metrics WHERE is_aggregated = 0 ORDER BY timestamp`, (err, rows) => {
-            if (err) {
-                console.error(`[${getCurrentTime()}] [DB] Error fetching data for aggregation:`, err.message);
-                return reject(err);
-            }
-
-            if (rows.length === 0) {
-                console.log(`[${getCurrentTime()}] [AGG] No data to aggregate`);
-                return resolve();
-            }
-
-            // Calculate averages
-            const avgIn1 = rows.reduce((sum, row) => sum + row.in1, 0) / rows.length;
-            const avgOut1 = rows.reduce((sum, row) => sum + row.out1, 0) / rows.length;
-            const avgIn2 = rows.reduce((sum, row) => sum + row.in2, 0) / rows.length;
-            const avgOut2 = rows.reduce((sum, row) => sum + row.out2, 0) / rows.length;
-            const avgCpu = Math.round(rows.reduce((sum, row) => sum + row.cpu, 0) / rows.length);
-            const avgMem = Math.round(rows.reduce((sum, row) => sum + row.mem, 0) / rows.length);
-
-            // Get the latest timestamp from the batch
-            const latestTimestamp = rows[rows.length - 1].timestamp;
-
-            // Insert aggregated record
-            const stmt = db.prepare(`INSERT INTO metrics (timestamp, in1, out1, in2, out2, cpu, mem, is_aggregated) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`);
-            stmt.run(
-                latestTimestamp,
-                avgIn1,
-                avgOut1,
-                avgIn2,
-                avgOut2,
-                avgCpu,
-                avgMem,
-                (err) => {
-                    if (err) {
-                        console.error(`[${getCurrentTime()}] [DB] Error inserting aggregated `, err.message);
-                        return reject(err);
-                    }
-
-                    // Mark original records as aggregated
-                    const ids = rows.map(row => row.id).join(',');
-                    db.run(`UPDATE metrics SET is_aggregated = 1 WHERE id IN (${ids})`, (err) => {
-                        if (err) {
-                            console.error(`[${getCurrentTime()}] [DB] Error marking records as aggregated:`, err.message);
-                        } else {
-                            console.log(`[${getCurrentTime()}] [AGG] Aggregated ${rows.length} records into 1 point`);
-                            
-                            // Add to aggregated data arrays
-                            const formattedTime = formatTime(latestTimestamp);
-                            aggTimes.push(formattedTime);
-                            aggInTraffic1.push(avgIn1);
-                            aggOutTraffic1.push(avgOut1);
-                            aggInTraffic2.push(avgIn2);
-                            aggOutTraffic2.push(avgOut2);
-                            aggCpuUsage.push(avgCpu);
-                            aggMemUsed.push(avgMem);
-                            
-                            // Limit aggregated arrays to MAX_AGGREGATED_POINTS
-                            if (aggTimes.length > MAX_AGGREGATED_POINTS) {
-                                aggTimes.shift();
-                                aggInTraffic1.shift();
-                                aggOutTraffic1.shift();
-                                aggInTraffic2.shift();
-                                aggOutTraffic2.shift();
-                                aggCpuUsage.shift();
-                                aggMemUsed.shift();
-                            }
-                        }
-                        resolve();
-                    });
-                }
-            );
-            stmt.finalize();
-        });
-    });
-}
-
-// Load current data points from database (latest MAX_DATA_POINTS non-aggregated records)
-async function loadCurrentData() {
-    return new Promise((resolve, reject) => {
-        // Get non-aggregated records (most recent MAX_DATA_POINTS)
-        db.all(`SELECT * FROM metrics WHERE is_aggregated = 0 ORDER BY timestamp DESC LIMIT ${MAX_DATA_POINTS}`, (err, rows) => {
-            if (err) {
-                console.error(`[${getCurrentTime()}] [DB] Error loading current `, err.message);
-                return reject(err);
-            }
-
-            // Reverse to get chronological order (oldest first)
-            rows.reverse();
-
-            // Format timestamps for display (UTC+3, 24h format)
-            times = rows.map(row => formatTime(row.timestamp));
-            inTraffic1 = rows.map(row => row.in1);
-            outTraffic1 = rows.map(row => row.out1);
-            inTraffic2 = rows.map(row => row.in2);
-            outTraffic2 = rows.map(row => row.out2);
-            cpuUsage = rows.map(row => row.cpu);
-            memUsed = rows.map(row => row.mem);
-
-            resolve();
-        });
-    });
-}
-
-// Load aggregated data points from database (latest MAX_AGGREGATED_POINTS aggregated records)
-async function loadAggregatedData() {
-    return new Promise((resolve, reject) => {
-        // Get aggregated records (most recent MAX_AGGREGATED_POINTS)
-        db.all(`SELECT * FROM metrics WHERE is_aggregated = 1 ORDER BY timestamp DESC LIMIT ${MAX_AGGREGATED_POINTS}`, (err, rows) => {
-            if (err) {
-                console.error(`[${getCurrentTime()}] [DB] Error loading aggregated `, err.message);
-                return reject(err);
-            }
-
-            // Reverse to get chronological order (oldest first)
-            rows.reverse();
-
-            // Format timestamps for display (UTC+3, 24h format)
-            aggTimes = rows.map(row => formatTime(row.timestamp));
-            aggInTraffic1 = rows.map(row => row.in1);
-            aggOutTraffic1 = rows.map(row => row.out1);
-            aggInTraffic2 = rows.map(row => row.in2);
-            aggOutTraffic2 = rows.map(row => row.out2);
-            aggCpuUsage = rows.map(row => row.cpu);
-            aggMemUsed = rows.map(row => row.mem);
-
-            resolve();
-        });
-    });
-}
-
-// Main polling function
 async function pollData() {
     const [inVal1, outVal1, inVal2, outVal2, cpuVal, memVal] = await Promise.all([
         getSnmpValue(OID_IN1),
@@ -293,8 +173,7 @@ async function pollData() {
         getSnmpValue(OID_MEMUSED)
     ]);
 
-    const now = new Date();
-    const nowFormatted = formatTime(now.toISOString());
+    const now = new Date().toLocaleTimeString();
 
     // Convert rate counters to Mbps (divide by 1e6)
     const inMbps1 = inVal1 != null ? inVal1 / 1e6 : 0;
@@ -302,18 +181,7 @@ async function pollData() {
     const inMbps2 = inVal2 != null ? inVal2 / 1e6 : 0;
     const outMbps2 = outVal2 != null ? outVal2 / 1e6 : 0;
 
-    // Save to database
-    saveToDatabase({
-        in1: inMbps1,
-        out1: outMbps1,
-        in2: inMbps2,
-        out2: outMbps2,
-        cpu: cpuVal != null ? parseInt(cpuVal) : 0,
-        mem: memVal != null ? parseInt(memVal) : 0
-    });
-
-    // Update in-memory arrays
-    times.push(nowFormatted);
+    times.push(now);
     inTraffic1.push(inMbps1);
     outTraffic1.push(outMbps1);
     inTraffic2.push(inMbps2);
@@ -321,7 +189,6 @@ async function pollData() {
     cpuUsage.push(cpuVal != null ? parseInt(cpuVal) : 0);
     memUsed.push(memVal != null ? parseInt(memVal) : 0);
 
-    // Keep only the latest MAX_DATA_POINTS
     if (times.length > MAX_DATA_POINTS) {
         times.shift();
         inTraffic1.shift();
@@ -332,33 +199,25 @@ async function pollData() {
         memUsed.shift();
     }
 
-    // Check if we need to aggregate (every MAX_DATA_POINTS collected)
-    if (times.length === MAX_DATA_POINTS) {
-        console.log(`[${getCurrentTime()}] [AGG] Reached ${MAX_DATA_POINTS} points, starting aggregation...`);
-        await aggregateData();
-        await loadCurrentData(); // Reload current data after aggregation
-    }
-
-    console.log(`[${getCurrentTime()}] [POLL] Intf1: In=${inMbps1.toFixed(3)}Mb/s, Out=${outMbps1.toFixed(3)}Mb/s | Intf2: In=${inMbps2.toFixed(3)}Mb/s, Out=${outMbps2.toFixed(3)}Mb/s | CPU: ${cpuVal || 'N/A'}% | MEM: ${memVal || 'N/A'}MB`);
+    console.log(`[${now}] [POLL] Intf1: In=${inMbps1.toFixed(3)}Mb/s, Out=${outMbps1.toFixed(3)}Mb/s | Intf2: In=${inMbps2.toFixed(3)}Mb/s, Out=${outMbps2.toFixed(3)}Mb/s | CPU: ${cpuVal || 'N/A'}% | MEM: ${memVal || 'N/A'}MB`);
 }
 
-// Initialize and start
-async function start() {
-    initDatabase();
-    
-    // Load existing data on startup
+// Initialize and start the application
+async function startApplication() {
     try {
-        await loadCurrentData();
-        await loadAggregatedData();
-        console.log(`[${getCurrentTime()}] [INIT] Loaded ${times.length} data points from database`);
-        console.log(`[${getCurrentTime()}] [INIT] Loaded ${aggTimes.length} aggregated data points from database`);
+        await initDatabase();
+        
+        // Start polling
+        setInterval(pollData, POLL_INTERVAL_SECONDS * 1000);
+        
+        // Start database saving
+        setInterval(saveAverageToDatabase, DB_SAVE_INTERVAL);
+        
+        console.log("SNMP monitoring started with database support...");
     } catch (error) {
-        console.error(`[${getCurrentTime()}] [INIT] Error loading initial `, error.message);
+        console.error('Failed to start application:', error);
+        process.exit(1);
     }
-    
-    // Start polling
-    setInterval(pollData, POLL_INTERVAL_SECONDS * 1000);
-    console.log(`[${getCurrentTime()}] SNMP monitoring started with ${MAX_DATA_POINTS} point limit (UTC+3 timezone)`);
 }
 
 // --- WEB SERVER ---
@@ -369,9 +228,8 @@ app.get("/", (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-  <title>SNMP Monitor</title>
+  <title>SNMP Monitor - Real-time & Historical</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <link rel="icon" href="data:,"> <!-- Prevents 404 for favicon -->
   <style>
     body { font-family: sans-serif; margin: 20px; }
     .chart-container {
@@ -395,24 +253,20 @@ app.get("/", (req, res) => {
       margin-top: 20px;
       margin-bottom: 5px;
     }
-    .timezone-info {
-      text-align: center;
-      color: #666;
-      margin-bottom: 15px;
-      font-style: italic;
-    }
     .section-title {
+      grid-column: 1 / -1;
       text-align: center;
-      font-size: 1.5em;
-      margin: 30px 0 10px 0;
-      color: #333;
+      margin: 40px 0 20px 0;
+      padding: 10px;
+      background: #f0f0f0;
+      border-radius: 5px;
     }
   </style>
 </head>
 <body>
-  <div class="timezone-info">All times displayed in a server timezone</div>
+  <h1>SNMP Monitor - Real-time & Historical Data</h1>
   
-  <div class="section-title">Latest Data</div>
+  <div class="section-title">Real-time Data (Last ${MAX_DATA_POINTS} points)</div>
   <div class="chart-container">
     <div>
       <h2>Interface A (Mb/s)</h2>
@@ -440,30 +294,30 @@ app.get("/", (req, res) => {
     </div>
   </div>
 
-  <div class="section-title">Historical Aggregated Data</div>
+  <div class="section-title">Historical Data (From Database)</div>
   <div class="chart-container">
     <div>
-      <h2>Interface A (Mb/s)</h2>
+      <h2>Historical Interface A (Mb/s)</h2>
       <div class="chart-wrapper">
-        <canvas id="aggTrafficChart1"></canvas>
+        <canvas id="historicalTrafficChart1"></canvas>
       </div>
     </div>
     <div>
-      <h2>Interface B (Mb/s)</h2>
+      <h2>Historical Interface B (Mb/s)</h2>
       <div class="chart-wrapper">
-        <canvas id="aggTrafficChart2"></canvas>
+        <canvas id="historicalTrafficChart2"></canvas>
       </div>
     </div>
     <div>
-      <h2>CPU Usage (%)</h2>
+      <h2>Historical CPU Usage (%)</h2>
       <div class="chart-wrapper">
-        <canvas id="aggCpuChart"></canvas>
+        <canvas id="historicalCpuChart"></canvas>
       </div>
     </div>
     <div>
-      <h2>Memory Used</h2>
+      <h2>Historical Memory Used</h2>
       <div class="chart-wrapper">
-        <canvas id="aggMemChart"></canvas>
+        <canvas id="historicalMemChart"></canvas>
       </div>
     </div>
   </div>
@@ -474,41 +328,53 @@ app.get("/", (req, res) => {
         return await res.json();
     }
 
-    // Initialize all charts for latest data
+    async function fetchHistoricalData() {
+        const res = await fetch('/historical-data');
+        return await res.json();
+    }
+
+    // Initialize real-time charts
     const trafficCtx1 = document.getElementById('trafficChart1').getContext('2d');
     const trafficCtx2 = document.getElementById('trafficChart2').getContext('2d');
     const cpuCtx = document.getElementById('cpuChart').getContext('2d');
     const memCtx = document.getElementById('memChart').getContext('2d');
 
+    // Initialize historical charts
+    const historicalTrafficCtx1 = document.getElementById('historicalTrafficChart1').getContext('2d');
+    const historicalTrafficCtx2 = document.getElementById('historicalTrafficChart2').getContext('2d');
+    const historicalCpuCtx = document.getElementById('historicalCpuChart').getContext('2d');
+    const historicalMemCtx = document.getElementById('historicalMemChart').getContext('2d');
+
+    const chartOptions = {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+            x: { display: true },
+            y: { beginAtZero: true }
+        }
+    };
+
+    const trafficChartOptions = {
+        ...chartOptions,
+        plugins: {
+            tooltip: {
+                callbacks: {
+                    label: function(context) {
+                        return context.dataset.label + ': ' + context.parsed.y.toFixed(3) + ' Mb/s';
+                    }
+                }
+            }
+        }
+    };
+
+    // Real-time charts
     const trafficChart1 = new Chart(trafficCtx1, {
         type: 'line',
         data: { labels: [], datasets: [
             { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
             { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
         ]},
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: { 
-                    display: true,
-                    ticks: {
-                        maxRotation: 0,
-                        autoSkip: true
-                    }
-                },
-                y: { beginAtZero: true }
-            },
-            plugins: {
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            return context.dataset.label + ': ' + context.parsed.y.toFixed(3) + ' Mb/s';
-                        }
-                    }
-                }
-            }
-        }
+        options: trafficChartOptions
     });
 
     const trafficChart2 = new Chart(trafficCtx2, {
@@ -517,29 +383,7 @@ app.get("/", (req, res) => {
             { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
             { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
         ]},
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: { 
-                    display: true,
-                    ticks: {
-                        maxRotation: 0,
-                        autoSkip: true
-                    }
-                },
-                y: { beginAtZero: true }
-            },
-            plugins: {
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            return context.dataset.label + ': ' + context.parsed.y.toFixed(3) + ' Mb/s';
-                        }
-                    }
-                }
-            }
-        }
+        options: trafficChartOptions
     });
 
     const cpuChart = new Chart(cpuCtx, {
@@ -547,20 +391,7 @@ app.get("/", (req, res) => {
         data: { labels: [], datasets: [
             { label: 'CPU %', data: [], borderColor: 'green', fill: false }
         ]},
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: { 
-                    display: true,
-                    ticks: {
-                        maxRotation: 0,
-                        autoSkip: true
-                    }
-                },
-                y: { beginAtZero: true, max: 100 }
-            }
-        }
+        options: { ...chartOptions, scales: { ...chartOptions.scales, y: { beginAtZero: true, max: 100 } } }
     });
 
     const memChart = new Chart(memCtx, {
@@ -568,172 +399,95 @@ app.get("/", (req, res) => {
         data: { labels: [], datasets: [
             { label: 'Memory Used', data: [], borderColor: 'orange', fill: false }
         ]},
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: { 
-                    display: true,
-                    ticks: {
-                        maxRotation: 0,
-                        autoSkip: true
-                    }
-                },
-                y: { beginAtZero: true }
-            }
-        }
+        options: chartOptions
     });
 
-    // Initialize all charts for aggregated data
-    const aggTrafficCtx1 = document.getElementById('aggTrafficChart1').getContext('2d');
-    const aggTrafficCtx2 = document.getElementById('aggTrafficChart2').getContext('2d');
-    const aggCpuCtx = document.getElementById('aggCpuChart').getContext('2d');
-    const aggMemCtx = document.getElementById('aggMemChart').getContext('2d');
-
-    const aggTrafficChart1 = new Chart(aggTrafficCtx1, {
+    // Historical charts
+    const historicalTrafficChart1 = new Chart(historicalTrafficCtx1, {
         type: 'line',
         data: { labels: [], datasets: [
             { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
             { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
         ]},
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: { 
-                    display: true,
-                    ticks: {
-                        maxRotation: 0,
-                        autoSkip: true
-                    }
-                },
-                y: { beginAtZero: true }
-            },
-            plugins: {
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            return context.dataset.label + ': ' + context.parsed.y.toFixed(3) + ' Mb/s';
-                        }
-                    }
-                }
-            }
-        }
+        options: trafficChartOptions
     });
 
-    const aggTrafficChart2 = new Chart(aggTrafficCtx2, {
+    const historicalTrafficChart2 = new Chart(historicalTrafficCtx2, {
         type: 'line',
         data: { labels: [], datasets: [
             { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
             { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
         ]},
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: { 
-                    display: true,
-                    ticks: {
-                        maxRotation: 0,
-                        autoSkip: true
-                    }
-                },
-                y: { beginAtZero: true }
-            },
-            plugins: {
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            return context.dataset.label + ': ' + context.parsed.y.toFixed(3) + ' Mb/s';
-                        }
-                    }
-                }
-            }
-        }
+        options: trafficChartOptions
     });
 
-    const aggCpuChart = new Chart(aggCpuCtx, {
+    const historicalCpuChart = new Chart(historicalCpuCtx, {
         type: 'line',
         data: { labels: [], datasets: [
             { label: 'CPU %', data: [], borderColor: 'green', fill: false }
         ]},
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: { 
-                    display: true,
-                    ticks: {
-                        maxRotation: 0,
-                        autoSkip: true
-                    }
-                },
-                y: { beginAtZero: true, max: 100 }
-            }
-        }
+        options: { ...chartOptions, scales: { ...chartOptions.scales, y: { beginAtZero: true, max: 100 } } }
     });
 
-    const aggMemChart = new Chart(aggMemCtx, {
+    const historicalMemChart = new Chart(historicalMemCtx, {
         type: 'line',
         data: { labels: [], datasets: [
             { label: 'Memory Used', data: [], borderColor: 'orange', fill: false }
         ]},
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: { 
-                    display: true,
-                    ticks: {
-                        maxRotation: 0,
-                        autoSkip: true
-                    }
-                },
-                y: { beginAtZero: true }
-            }
-        }
+        options: chartOptions
     });
 
     async function updateCharts() {
-        const data = await fetchData();
+        try {
+            const [realTimeData, historicalData] = await Promise.all([
+                fetchData(),
+                fetchHistoricalData()
+            ]);
 
-        // Update latest data charts
-        trafficChart1.data.labels = data.times;
-        trafficChart1.data.datasets[0].data = data.inTraffic1;
-        trafficChart1.data.datasets[1].data = data.outTraffic1;
-        trafficChart1.update();
+            // Update real-time charts
+            trafficChart1.data.labels = realTimeData.times;
+            trafficChart1.data.datasets[0].data = realTimeData.inTraffic1;
+            trafficChart1.data.datasets[1].data = realTimeData.outTraffic1;
+            trafficChart1.update();
 
-        trafficChart2.data.labels = data.times;
-        trafficChart2.data.datasets[0].data = data.inTraffic2;
-        trafficChart2.data.datasets[1].data = data.outTraffic2;
-        trafficChart2.update();
+            trafficChart2.data.labels = realTimeData.times;
+            trafficChart2.data.datasets[0].data = realTimeData.inTraffic2;
+            trafficChart2.data.datasets[1].data = realTimeData.outTraffic2;
+            trafficChart2.update();
 
-        cpuChart.data.labels = data.times;
-        cpuChart.data.datasets[0].data = data.cpuUsage;
-        cpuChart.update();
+            cpuChart.data.labels = realTimeData.times;
+            cpuChart.data.datasets[0].data = realTimeData.cpuUsage;
+            cpuChart.update();
 
-        memChart.data.labels = data.times;
-        memChart.data.datasets[0].data = data.memUsed;
-        memChart.update();
+            memChart.data.labels = realTimeData.times;
+            memChart.data.datasets[0].data = realTimeData.memUsed;
+            memChart.update();
 
-        // Update aggregated data charts
-        aggTrafficChart1.data.labels = data.aggTimes;
-        aggTrafficChart1.data.datasets[0].data = data.aggInTraffic1;
-        aggTrafficChart1.data.datasets[1].data = data.aggOutTraffic1;
-        aggTrafficChart1.update();
+            // Update historical charts
+            if (historicalData && historicalData.length > 0) {
+                const labels = historicalData.map(item => item.timestamp);
+                
+                historicalTrafficChart1.data.labels = labels;
+                historicalTrafficChart1.data.datasets[0].data = historicalData.map(item => item.in_traffic1);
+                historicalTrafficChart1.data.datasets[1].data = historicalData.map(item => item.out_traffic1);
+                historicalTrafficChart1.update();
 
-        aggTrafficChart2.data.labels = data.aggTimes;
-        aggTrafficChart2.data.datasets[0].data = data.aggInTraffic2;
-        aggTrafficChart2.data.datasets[1].data = data.aggOutTraffic2;
-        aggTrafficChart2.update();
+                historicalTrafficChart2.data.labels = labels;
+                historicalTrafficChart2.data.datasets[0].data = historicalData.map(item => item.in_traffic2);
+                historicalTrafficChart2.data.datasets[1].data = historicalData.map(item => item.out_traffic2);
+                historicalTrafficChart2.update();
 
-        aggCpuChart.data.labels = data.aggTimes;
-        aggCpuChart.data.datasets[0].data = data.aggCpuUsage;
-        aggCpuChart.update();
+                historicalCpuChart.data.labels = labels;
+                historicalCpuChart.data.datasets[0].data = historicalData.map(item => item.cpu_usage);
+                historicalCpuChart.update();
 
-        aggMemChart.data.labels = data.aggTimes;
-        aggMemChart.data.datasets[0].data = data.aggMemUsed;
-        aggMemChart.update();
+                historicalMemChart.data.labels = labels;
+                historicalMemChart.data.datasets[0].data = historicalData.map(item => item.mem_used);
+                historicalMemChart.update();
+            }
+        } catch (error) {
+            console.error('Error updating charts:', error);
+        }
     }
 
     setInterval(updateCharts, ${POLL_INTERVAL_SECONDS * 1000});
@@ -744,8 +498,7 @@ app.get("/", (req, res) => {
     `);
 });
 
-app.get("/data", async (req, res) => {
-    // Always return current in-memory data
+app.get("/data", (req, res) => {
     res.json({
         times,
         inTraffic1,
@@ -753,20 +506,24 @@ app.get("/data", async (req, res) => {
         inTraffic2,
         outTraffic2,
         cpuUsage,
-        memUsed,
-        aggTimes,
-        aggInTraffic1,
-        aggOutTraffic1,
-        aggInTraffic2,
-        aggOutTraffic2,
-        aggCpuUsage,
-        aggMemUsed
+        memUsed
     });
 });
 
-// Start everything
-start();
+app.get("/historical-data", async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 100;
+        const historicalData = await getHistoricalData(limit);
+        res.json(historicalData);
+    } catch (error) {
+        console.error('Error fetching historical data:', error);
+        res.status(500).json({ error: 'Failed to fetch historical data' });
+    }
+});
 
-app.listen(4000, "0.0.0.0", () => {
-    console.log(`[${getCurrentTime()}] Server running on http://*:4000/ (UTC+3 timezone)`);
+// Start the application
+startApplication().then(() => {
+    app.listen(4000, "0.0.0.0", () => {
+        console.log("Server running on http://*:4000/");
+    });
 });
