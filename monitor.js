@@ -1,7 +1,9 @@
-// monitor.js - 2x2 grid version
+// monitor.js - 2x2 grid version with SQLite storage, aggregation, and UTC+3 timezone
 const express = require("express");
 const { exec } = require("child_process");
 const util = require("util");
+const sqlite3 = require("sqlite3").verbose();
+const path = require("path");
 const execAsync = util.promisify(exec);
 
 // --- SETTINGS ---
@@ -18,7 +20,39 @@ const OID_CPU = "1.3.6.1.4.1.23668.8107.1.6.1.0"; // CPU counter32
 const OID_MEMUSED = "1.3.6.1.4.1.23668.8107.1.6.7.0"; // Counter64
 
 const POLL_INTERVAL_SECONDS = 5;
-const MAX_DATA_POINTS = 120;
+const MAX_DATA_POINTS = 150; // 150 points * 5 sec = 12.5 minutes
+const TIMEZONE = "UTC+3";
+
+// --- DATABASE SETUP ---
+const DB_PATH = path.join(__dirname, "monitor.db");
+let db;
+
+function initDatabase() {
+    db = new sqlite3.Database(DB_PATH, (err) => {
+        if (err) {
+            console.error(`[${getCurrentTime()}] [DB] Error opening database:`, err.message);
+        } else {
+            console.log(`[${getCurrentTime()}] [DB] Connected to SQLite database`);
+        }
+    });
+
+    // Create table if not exists
+    db.run(`CREATE TABLE IF NOT EXISTS metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        in1 REAL,
+        out1 REAL,
+        in2 REAL,
+        out2 REAL,
+        cpu INTEGER,
+        mem INTEGER,
+        is_aggregated BOOLEAN DEFAULT 0
+    )`, (err) => {
+        if (err) {
+            console.error(`[${getCurrentTime()}] [DB] Error creating table:`, err.message);
+        }
+    });
+}
 
 // --- DATA STORAGE ---
 let times = [];
@@ -29,44 +63,165 @@ let outTraffic2 = [];
 let cpuUsage = [];
 let memUsed = [];
 
-// --- HELPER: format timestamp ---
-function nowTime() {
-    return new Date().toLocaleTimeString();
+// --- HELPER: Get current time in UTC+3 with 24h format ---
+function getCurrentTime() {
+    const now = new Date();
+    const utcPlus3 = new Date(now.getTime() + (3 * 60 * 60 * 1000));
+    return utcPlus3.toISOString().replace('T', ' ').substring(0, 19) + ' (UTC+3)';
+}
+
+// --- HELPER: Format timestamp for display (24h format, UTC+3) ---
+function formatTime(timestamp) {
+    // Convert ISO string to Date object
+    const date = new Date(timestamp);
+    // Add 3 hours for UTC+3
+    const utcPlus3 = new Date(date.getTime() + (3 * 60 * 60 * 1000));
+    // Format as HH:MM:SS (24-hour format)
+    const hours = utcPlus3.getHours().toString().padStart(2, '0');
+    const minutes = utcPlus3.getMinutes().toString().padStart(2, '0');
+    const seconds = utcPlus3.getSeconds().toString().padStart(2, '0');
+    return `${hours}:${minutes}:${seconds}`;
 }
 
 // Function to get SNMP value using command line
 async function getSnmpValue(oid) {
     try {
         const command = `snmpget -v2c -c ${SNMP_COMMUNITY} ${SNMP_HOST}:${SNMP_PORT} ${oid}`;
-        console.log(`[${nowTime()}] [CMD] Executing: ${command}`);
+        console.log(`[${getCurrentTime()}] [CMD] Executing: ${command}`);
 
         const { stdout, stderr } = await execAsync(command, { timeout: 10000 });
 
         if (stderr) {
-            console.error(`[${nowTime()}] [CMD] Error:`, stderr);
+            console.error(`[${getCurrentTime()}] [CMD] Error:`, stderr);
             return null;
         }
 
         // Parse the output: "OID = Counter64: value" or "OID = INTEGER: value"
         const output = stdout.trim();
-        console.log(`[${nowTime()}] [CMD] Output: ${output}`);
+        console.log(`[${getCurrentTime()}] [CMD] Output: ${output}`);
 
         // Extract the value part
         const match = output.match(/=\s*(?:Counter64|INTEGER|Gauge32|Counter32):\s*(\d+)/i);
         if (match) {
             const value = parseInt(match[1]);
-            console.log(`[${nowTime()}] [CMD] Parsed value: ${value}`);
+            console.log(`[${getCurrentTime()}] [CMD] Parsed value: ${value}`);
             return value;
         } else {
-            console.error(`[${nowTime()}] [CMD] Could not parse value from: ${output}`);
+            console.error(`[${getCurrentTime()}] [CMD] Could not parse value from: ${output}`);
             return null;
         }
     } catch (error) {
-        console.error(`[${nowTime()}] [CMD] Command failed for ${oid}:`, error.message);
+        console.error(`[${getCurrentTime()}] [CMD] Command failed for ${oid}:`, error.message);
         return null;
     }
 }
 
+// Save data point to database
+function saveToDatabase(data) {
+    const stmt = db.prepare(`INSERT INTO metrics (in1, out1, in2, out2, cpu, mem) VALUES (?, ?, ?, ?, ?, ?)`);
+    stmt.run(
+        data.in1,
+        data.out1,
+        data.in2,
+        data.out2,
+        data.cpu,
+        data.mem,
+        (err) => {
+            if (err) {
+                console.error(`[${getCurrentTime()}] [DB] Error inserting `, err.message);
+            }
+        }
+    );
+    stmt.finalize();
+}
+
+// Aggregate data points into averages
+async function aggregateData() {
+    return new Promise((resolve, reject) => {
+        // Get all non-aggregated data points
+        db.all(`SELECT * FROM metrics WHERE is_aggregated = 0 ORDER BY timestamp`, (err, rows) => {
+            if (err) {
+                console.error(`[${getCurrentTime()}] [DB] Error fetching data for aggregation:`, err.message);
+                return reject(err);
+            }
+
+            if (rows.length === 0) {
+                console.log(`[${getCurrentTime()}] [AGG] No data to aggregate`);
+                return resolve();
+            }
+
+            // Calculate averages
+            const avgIn1 = rows.reduce((sum, row) => sum + row.in1, 0) / rows.length;
+            const avgOut1 = rows.reduce((sum, row) => sum + row.out1, 0) / rows.length;
+            const avgIn2 = rows.reduce((sum, row) => sum + row.in2, 0) / rows.length;
+            const avgOut2 = rows.reduce((sum, row) => sum + row.out2, 0) / rows.length;
+            const avgCpu = Math.round(rows.reduce((sum, row) => sum + row.cpu, 0) / rows.length);
+            const avgMem = Math.round(rows.reduce((sum, row) => sum + row.mem, 0) / rows.length);
+
+            // Get the latest timestamp from the batch
+            const latestTimestamp = rows[rows.length - 1].timestamp;
+
+            // Insert aggregated record
+            const stmt = db.prepare(`INSERT INTO metrics (timestamp, in1, out1, in2, out2, cpu, mem, is_aggregated) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`);
+            stmt.run(
+                latestTimestamp,
+                avgIn1,
+                avgOut1,
+                avgIn2,
+                avgOut2,
+                avgCpu,
+                avgMem,
+                (err) => {
+                    if (err) {
+                        console.error(`[${getCurrentTime()}] [DB] Error inserting aggregated `, err.message);
+                        return reject(err);
+                    }
+
+                    // Mark original records as aggregated
+                    const ids = rows.map(row => row.id).join(',');
+                    db.run(`UPDATE metrics SET is_aggregated = 1 WHERE id IN (${ids})`, (err) => {
+                        if (err) {
+                            console.error(`[${getCurrentTime()}] [DB] Error marking records as aggregated:`, err.message);
+                        } else {
+                            console.log(`[${getCurrentTime()}] [AGG] Aggregated ${rows.length} records into 1 point`);
+                        }
+                        resolve();
+                    });
+                }
+            );
+            stmt.finalize();
+        });
+    });
+}
+
+// Load current data points from database (latest MAX_DATA_POINTS non-aggregated records)
+async function loadCurrentData() {
+    return new Promise((resolve, reject) => {
+        // Get non-aggregated records (most recent MAX_DATA_POINTS)
+        db.all(`SELECT * FROM metrics WHERE is_aggregated = 0 ORDER BY timestamp DESC LIMIT ${MAX_DATA_POINTS}`, (err, rows) => {
+            if (err) {
+                console.error(`[${getCurrentTime()}] [DB] Error loading current `, err.message);
+                return reject(err);
+            }
+
+            // Reverse to get chronological order (oldest first)
+            rows.reverse();
+
+            // Format timestamps for display (UTC+3, 24h format)
+            times = rows.map(row => formatTime(row.timestamp));
+            inTraffic1 = rows.map(row => row.in1);
+            outTraffic1 = rows.map(row => row.out1);
+            inTraffic2 = rows.map(row => row.in2);
+            outTraffic2 = rows.map(row => row.out2);
+            cpuUsage = rows.map(row => row.cpu);
+            memUsed = rows.map(row => row.mem);
+
+            resolve();
+        });
+    });
+}
+
+// Main polling function
 async function pollData() {
     const [inVal1, outVal1, inVal2, outVal2, cpuVal, memVal] = await Promise.all([
         getSnmpValue(OID_IN1),
@@ -77,7 +232,8 @@ async function pollData() {
         getSnmpValue(OID_MEMUSED)
     ]);
 
-    const now = new Date().toLocaleTimeString();
+    const now = new Date();
+    const nowFormatted = formatTime(now.toISOString());
 
     // Convert rate counters to Mbps (divide by 1e6)
     const inMbps1 = inVal1 != null ? inVal1 / 1e6 : 0;
@@ -85,30 +241,51 @@ async function pollData() {
     const inMbps2 = inVal2 != null ? inVal2 / 1e6 : 0;
     const outMbps2 = outVal2 != null ? outVal2 / 1e6 : 0;
 
-    times.push(now);
+    // Save to database
+    saveToDatabase({
+        in1: inMbps1,
+        out1: outMbps1,
+        in2: inMbps2,
+        out2: outMbps2,
+        cpu: cpuVal != null ? parseInt(cpuVal) : 0,
+        mem: memVal != null ? parseInt(memVal) : 0
+    });
+
+    // Update in-memory arrays
+    times.push(nowFormatted);
     inTraffic1.push(inMbps1);
     outTraffic1.push(outMbps1);
     inTraffic2.push(inMbps2);
     outTraffic2.push(outMbps2);
     cpuUsage.push(cpuVal != null ? parseInt(cpuVal) : 0);
-    memUsed.push(memVal != null ? parseInt(memVal) : 0); // Memory in MB or bytes depending on device
+    memUsed.push(memVal != null ? parseInt(memVal) : 0);
 
-    if (times.length > MAX_DATA_POINTS) {
-        times.shift();
-        inTraffic1.shift();
-        outTraffic1.shift();
-        inTraffic2.shift();
-        outTraffic2.shift();
-        cpuUsage.shift();
-        memUsed.shift();
+    // Check if we need to aggregate
+    if (times.length >= MAX_DATA_POINTS) {
+        console.log(`[${getCurrentTime()}] [AGG] Reached ${MAX_DATA_POINTS} points, starting aggregation...`);
+        await aggregateData();
+        await loadCurrentData(); // Reload current data after aggregation
     }
 
-    console.log(`[${now}] [POLL] Intf1: In=${inMbps1.toFixed(3)}Mb/s, Out=${outMbps1.toFixed(3)}Mb/s | Intf2: In=${inMbps2.toFixed(3)}Mb/s, Out=${outMbps2.toFixed(3)}Mb/s | CPU: ${cpuVal || 'N/A'}% | MEM: ${memVal || 'N/A'}MB`);
+    console.log(`[${getCurrentTime()}] [POLL] Intf1: In=${inMbps1.toFixed(3)}Mb/s, Out=${outMbps1.toFixed(3)}Mb/s | Intf2: In=${inMbps2.toFixed(3)}Mb/s, Out=${outMbps2.toFixed(3)}Mb/s | CPU: ${cpuVal || 'N/A'}% | MEM: ${memVal || 'N/A'}MB`);
 }
 
-// Start polling
-setInterval(pollData, POLL_INTERVAL_SECONDS * 1000);
-console.log("SNMP monitoring started...");
+// Initialize and start
+async function start() {
+    initDatabase();
+    
+    // Load existing data on startup
+    try {
+        await loadCurrentData();
+        console.log(`[${getCurrentTime()}] [INIT] Loaded ${times.length} data points from database`);
+    } catch (error) {
+        console.error(`[${getCurrentTime()}] [INIT] Error loading initial `, error.message);
+    }
+    
+    // Start polling
+    setInterval(pollData, POLL_INTERVAL_SECONDS * 1000);
+    console.log(`[${getCurrentTime()}] SNMP monitoring started with ${MAX_DATA_POINTS} point limit (UTC+3 timezone)`);
+}
 
 // --- WEB SERVER ---
 const app = express();
@@ -118,7 +295,7 @@ app.get("/", (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-  <title>SNMP Monitor</title>
+  <title>SNMP Monitor (UTC+3)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     body { font-family: sans-serif; margin: 20px; }
@@ -143,9 +320,16 @@ app.get("/", (req, res) => {
       margin-top: 20px;
       margin-bottom: 5px;
     }
+    .timezone-info {
+      text-align: center;
+      color: #666;
+      margin-bottom: 15px;
+      font-style: italic;
+    }
   </style>
 </head>
 <body>
+  <div class="timezone-info">All times displayed in UTC+3 (24-hour format)</div>
   <div class="chart-container">
     <div>
       <h2>Interface A (Mb/s)</h2>
@@ -187,15 +371,21 @@ app.get("/", (req, res) => {
 
     const trafficChart1 = new Chart(trafficCtx1, {
         type: 'line',
-        data: { labels: [], datasets: [
-            { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
-            { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
+         { labels: [], datasets: [
+            { label: 'In Mb/s',  [], borderColor: 'blue', fill: false },
+            { label: 'Out Mb/s',  [], borderColor: 'red', fill: false }
         ]},
         options: {
             responsive: true,
             maintainAspectRatio: false,
             scales: {
-                x: { display: true },
+                x: { 
+                    display: true,
+                    ticks: {
+                        maxRotation: 0,
+                        autoSkip: true
+                    }
+                },
                 y: { beginAtZero: true }
             },
             plugins: {
@@ -213,14 +403,20 @@ app.get("/", (req, res) => {
     const trafficChart2 = new Chart(trafficCtx2, {
         type: 'line',
         data: { labels: [], datasets: [
-            { label: 'In Mb/s', data: [], borderColor: 'blue', fill: false },
-            { label: 'Out Mb/s', data: [], borderColor: 'red', fill: false }
+            { label: 'In Mb/s',  [], borderColor: 'blue', fill: false },
+            { label: 'Out Mb/s',  [], borderColor: 'red', fill: false }
         ]},
         options: {
             responsive: true,
             maintainAspectRatio: false,
             scales: {
-                x: { display: true },
+                x: { 
+                    display: true,
+                    ticks: {
+                        maxRotation: 0,
+                        autoSkip: true
+                    }
+                },
                 y: { beginAtZero: true }
             },
             plugins: {
@@ -237,14 +433,20 @@ app.get("/", (req, res) => {
 
     const cpuChart = new Chart(cpuCtx, {
         type: 'line',
-        data: { labels: [], datasets: [
-            { label: 'CPU %', data: [], borderColor: 'green', fill: false }
+         { labels: [], datasets: [
+            { label: 'CPU %',  [], borderColor: 'green', fill: false }
         ]},
         options: {
             responsive: true,
             maintainAspectRatio: false,
             scales: {
-                x: { display: true },
+                x: { 
+                    display: true,
+                    ticks: {
+                        maxRotation: 0,
+                        autoSkip: true
+                    }
+                },
                 y: { beginAtZero: true, max: 100 }
             }
         }
@@ -252,14 +454,20 @@ app.get("/", (req, res) => {
 
     const memChart = new Chart(memCtx, {
         type: 'line',
-        data: { labels: [], datasets: [
-            { label: 'Memory Used', data: [], borderColor: 'orange', fill: false }
+         { labels: [], datasets: [
+            { label: 'Memory Used',  [], borderColor: 'orange', fill: false }
         ]},
         options: {
             responsive: true,
             maintainAspectRatio: false,
             scales: {
-                x: { display: true },
+                x: { 
+                    display: true,
+                    ticks: {
+                        maxRotation: 0,
+                        autoSkip: true
+                    }
+                },
                 y: { beginAtZero: true }
             }
         }
@@ -299,18 +507,28 @@ app.get("/", (req, res) => {
     `);
 });
 
-app.get("/data", (req, res) => {
-    res.json({
-        times,
-        inTraffic1,
-        outTraffic1,
-        inTraffic2,
-        outTraffic2,
-        cpuUsage,
-        memUsed
-    });
+app.get("/data", async (req, res) => {
+    // Always load fresh data from DB to ensure consistency
+    try {
+        await loadCurrentData();
+        res.json({
+            times,
+            inTraffic1,
+            outTraffic1,
+            inTraffic2,
+            outTraffic2,
+            cpuUsage,
+            memUsed
+        });
+    } catch (error) {
+        console.error(`[${getCurrentTime()}] [API] Error loading `, error.message);
+        res.status(500).json({ error: "Failed to load data" });
+    }
 });
 
+// Start everything
+start();
+
 app.listen(4000, "0.0.0.0", () => {
-    console.log("Server running on http://*:4000/");
+    console.log(`[${getCurrentTime()}] Server running on http://*:4000/ (UTC+3 timezone)`);
 });
