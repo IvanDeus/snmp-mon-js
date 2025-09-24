@@ -1,4 +1,4 @@
-// monitor-command-line.js - Enhanced with SQLite historical data
+// monitor.js - Enhanced with SQLite historical data
 const express = require("express");
 const { exec } = require("child_process");
 const util = require("util");
