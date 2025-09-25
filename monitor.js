@@ -523,7 +523,8 @@ app.get("/historical-data", async (req, res) => {
 
 // Start the application
 startApplication().then(() => {
-    app.listen(4000, "0.0.0.0", () => {
-        console.log("Server running on http://*:4000/");
+    const PORT = 8000;
+    app.listen(PORT, "0.0.0.0", () => {
+        console.log(`Server running on http://*:${PORT}/`);
     });
 });
