@@ -5,39 +5,38 @@ const util = require("util");
 const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
 const fs = require("fs");
-
 const execAsync = util.promisify(exec);
-
 // --- SETTINGS ---
 const SNMP_HOST = "10.1.108.43";
 const SNMP_PORT = 161;
 const SNMP_COMMUNITY = "comm1";
-
 // Use the original OIDs from your snmpwalk
 const OID_IN1 = "1.3.6.1.4.1.23668.8107.2.1.1.110.13";
 const OID_OUT1 = "1.3.6.1.4.1.23668.8107.2.1.1.121.13";
 const OID_IN2 = "1.3.6.1.4.1.23668.8107.2.1.1.110.14";
 const OID_OUT2 = "1.3.6.1.4.1.23668.8107.2.1.1.121.14";
-const OID_CPU = "1.3.6.1.4.1.23668.8107.1.6.1.0";
+const OID_CPU1 = "1.3.6.1.4.1.23668.8107.2.4.1.2.0";
+const OID_CPU2 = "1.3.6.1.4.1.23668.8107.2.4.1.2.1";
+const OID_CPU3 = "1.3.6.1.4.1.23668.8107.2.4.1.2.2";
+const OID_CPU4 = "1.3.6.1.4.1.23668.8107.2.4.1.2.3";
 const OID_MEMUSED = "1.3.6.1.4.1.23668.8107.1.6.7.0"; // Counter64
-
 const POLL_INTERVAL_SECONDS = 5;
 const MAX_DATA_POINTS = 150;
 const DB_SAVE_INTERVAL = MAX_DATA_POINTS * 5 * 1000; // Save every MAX_DATA_POINTS * 5 seconds
-
 // --- DATA STORAGE ---
 let times = [];
 let inTraffic1 = [];
 let outTraffic1 = [];
 let inTraffic2 = [];
 let outTraffic2 = [];
-let cpuUsage = [];
+let cpuUsage1 = [];
+let cpuUsage2 = [];
+let cpuUsage3 = [];
+let cpuUsage4 = [];
 let memUsed = [];
-
 // --- SQLITE DATABASE ---
 const DB_PATH = path.join(__dirname, 'monitor.db');
 let db;
-
 // Initialize database
 function initDatabase() {
     return new Promise((resolve, reject) => {
@@ -47,7 +46,6 @@ function initDatabase() {
                 reject(err);
                 return;
             }
-
             // Create table if it doesn't exist
             db.run(`
                 CREATE TABLE IF NOT EXISTS historical_data (
@@ -57,7 +55,10 @@ function initDatabase() {
                     out_traffic1 REAL,
                     in_traffic2 REAL,
                     out_traffic2 REAL,
-                    cpu_usage REAL,
+                    cpu_usage1 REAL,
+                    cpu_usage2 REAL,
+                    cpu_usage3 REAL,
+                    cpu_usage4 REAL,
                     mem_used REAL
                 )
             `, (err) => {
@@ -72,24 +73,24 @@ function initDatabase() {
         });
     });
 }
-
 // Save average data to database
 function saveAverageToDatabase() {
     if (times.length === 0) return;
-
     // Calculate averages
     const avgInTraffic1 = inTraffic1.reduce((a, b) => a + b, 0) / inTraffic1.length;
     const avgOutTraffic1 = outTraffic1.reduce((a, b) => a + b, 0) / outTraffic1.length;
     const avgInTraffic2 = inTraffic2.reduce((a, b) => a + b, 0) / inTraffic2.length;
     const avgOutTraffic2 = outTraffic2.reduce((a, b) => a + b, 0) / outTraffic2.length;
-    const avgCpuUsage = cpuUsage.reduce((a, b) => a + b, 0) / cpuUsage.length;
+    const avgCpuUsage1 = cpuUsage1.reduce((a, b) => a + b, 0) / cpuUsage1.length;
+    const avgCpuUsage2 = cpuUsage2.reduce((a, b) => a + b, 0) / cpuUsage2.length;
+    const avgCpuUsage3 = cpuUsage3.reduce((a, b) => a + b, 0) / cpuUsage3.length;
+    const avgCpuUsage4 = cpuUsage4.reduce((a, b) => a + b, 0) / cpuUsage4.length;
     const avgMemUsed = memUsed.reduce((a, b) => a + b, 0) / memUsed.length;
-
     db.run(`
-        INSERT INTO historical_data 
-        (in_traffic1, out_traffic1, in_traffic2, out_traffic2, cpu_usage, mem_used)
-        VALUES (?, ?, ?, ?, ?, ?)
-    `, [avgInTraffic1, avgOutTraffic1, avgInTraffic2, avgOutTraffic2, avgCpuUsage, avgMemUsed], 
+        INSERT INTO historical_data
+        (in_traffic1, out_traffic1, in_traffic2, out_traffic2, cpu_usage1, cpu_usage2, cpu_usage3, cpu_usage4, mem_used)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [avgInTraffic1, avgOutTraffic1, avgInTraffic2, avgOutTraffic2, avgCpuUsage1, avgCpuUsage2, avgCpuUsage3, avgCpuUsage4, avgMemUsed],
     (err) => {
         if (err) {
             console.error('Error saving to database:', err);
@@ -98,21 +99,23 @@ function saveAverageToDatabase() {
         }
     });
 }
-
 // Get historical data from database
 function getHistoricalData(limit = 100) {
     return new Promise((resolve, reject) => {
         db.all(`
-            SELECT 
+            SELECT
                 datetime(timestamp, 'localtime') as timestamp,
                 in_traffic1,
                 out_traffic1,
                 in_traffic2,
                 out_traffic2,
-                cpu_usage,
+                cpu_usage1,
+                cpu_usage2,
+                cpu_usage3,
+                cpu_usage4,
                 mem_used
-            FROM historical_data 
-            ORDER BY timestamp DESC 
+            FROM historical_data
+            ORDER BY timestamp DESC
             LIMIT ?
         `, [limit], (err, rows) => {
             if (err) {
@@ -124,29 +127,23 @@ function getHistoricalData(limit = 100) {
         });
     });
 }
-
 // --- HELPER: format timestamp ---
 function nowTime() {
     return new Date().toLocaleTimeString();
 }
-
 // Function to get SNMP value using command line
 async function getSnmpValue(oid) {
     try {
         const command = `snmpget -v2c -c ${SNMP_COMMUNITY} ${SNMP_HOST}:${SNMP_PORT} ${oid}`;
         console.log(`[${nowTime()}] [CMD] Executing: ${command}`);
-
         const { stdout, stderr } = await execAsync(command, { timeout: 10000 });
-
         if (stderr) {
             console.error(`[${nowTime()}] [CMD] Error:`, stderr);
             return null;
         }
-
         // Parse the output: "OID = Counter64: value" or "OID = INTEGER: value"
         const output = stdout.trim();
         console.log(`[${nowTime()}] [CMD] Output: ${output}`);
-
         // Extract the value part
         const match = output.match(/=\s*(?:Counter64|INTEGER|Gauge32|Counter32):\s*(\d+)/i);
         if (match) {
@@ -162,67 +159,67 @@ async function getSnmpValue(oid) {
         return null;
     }
 }
-
 async function pollData() {
-    const [inVal1, outVal1, inVal2, outVal2, cpuVal, memVal] = await Promise.all([
+    const [inVal1, outVal1, inVal2, outVal2, cpuVal1, cpuVal2, cpuVal3, cpuVal4, memVal] = await Promise.all([
         getSnmpValue(OID_IN1),
         getSnmpValue(OID_OUT1),
         getSnmpValue(OID_IN2),
         getSnmpValue(OID_OUT2),
-        getSnmpValue(OID_CPU),
+        getSnmpValue(OID_CPU1),
+        getSnmpValue(OID_CPU2),
+        getSnmpValue(OID_CPU3),
+        getSnmpValue(OID_CPU4),
         getSnmpValue(OID_MEMUSED)
     ]);
-
     const now = new Date().toLocaleTimeString();
-
     // Convert rate counters to Mbps (divide by 1e6)
     const inMbps1 = inVal1 != null ? inVal1 / 1e6 : 0;
     const outMbps1 = outVal1 != null ? outVal1 / 1e6 : 0;
     const inMbps2 = inVal2 != null ? inVal2 / 1e6 : 0;
     const outMbps2 = outVal2 != null ? outVal2 / 1e6 : 0;
-
     times.push(now);
     inTraffic1.push(inMbps1);
     outTraffic1.push(outMbps1);
     inTraffic2.push(inMbps2);
     outTraffic2.push(outMbps2);
-    cpuUsage.push(cpuVal != null ? parseInt(cpuVal) : 0);
+    cpuUsage1.push(cpuVal1 != null ? parseInt(cpuVal1) : 0);
+    cpuUsage2.push(cpuVal2 != null ? parseInt(cpuVal2) : 0);
+    cpuUsage3.push(cpuVal3 != null ? parseInt(cpuVal3) : 0);
+    cpuUsage4.push(cpuVal4 != null ? parseInt(cpuVal4) : 0);
     memUsed.push(memVal != null ? parseInt(memVal) : 0);
-
     if (times.length > MAX_DATA_POINTS) {
         times.shift();
         inTraffic1.shift();
         outTraffic1.shift();
         inTraffic2.shift();
         outTraffic2.shift();
-        cpuUsage.shift();
+        cpuUsage1.shift();
+        cpuUsage2.shift();
+        cpuUsage3.shift();
+        cpuUsage4.shift();
         memUsed.shift();
     }
-
-    console.log(`[${now}] [POLL] Intf1: In=${inMbps1.toFixed(3)}Mb/s, Out=${outMbps1.toFixed(3)}Mb/s | Intf2: In=${inMbps2.toFixed(3)}Mb/s, Out=${outMbps2.toFixed(3)}Mb/s | CPU: ${cpuVal || 'N/A'}% | MEM: ${memVal || 'N/A'}MB`);
+    console.log(`[${now}] [POLL] Intf1: In=${inMbps1.toFixed(3)}Mb/s, Out=${outMbps1.toFixed(3)}Mb/s | Intf2: In=${inMbps2.toFixed(3)}Mb/s, Out=${outMbps2.toFixed(3)}Mb/s | CPU1: ${cpuVal1 || 'N/A'}% | CPU2: ${cpuVal2 || 'N/A'}% | CPU3: ${cpuVal3 || 'N/A'}% | CPU4: ${cpuVal4 || 'N/A'}% | MEM: ${memVal || 'N/A'}MB`);
 }
-
 // Initialize and start the application
 async function startApplication() {
     try {
         await initDatabase();
-        
+       
         // Start polling
         setInterval(pollData, POLL_INTERVAL_SECONDS * 1000);
-        
+       
         // Start database saving
         setInterval(saveAverageToDatabase, DB_SAVE_INTERVAL);
-        
+       
         console.log("SNMP monitoring started with database support...");
     } catch (error) {
         console.error('Failed to start application:', error);
         process.exit(1);
     }
 }
-
 // --- WEB SERVER ---
 const app = express();
-
 app.get("/", (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -265,7 +262,7 @@ app.get("/", (req, res) => {
 </head>
 <body>
   <h1>SNMP Monitor - Real-time & Historical Data</h1>
-  
+ 
   <div class="section-title">Real-time Data (Last ${MAX_DATA_POINTS} points)</div>
   <div class="chart-container">
     <div>
@@ -293,7 +290,6 @@ app.get("/", (req, res) => {
       </div>
     </div>
   </div>
-
   <div class="section-title">Historical Data (From Database)</div>
   <div class="chart-container">
     <div>
@@ -321,30 +317,25 @@ app.get("/", (req, res) => {
       </div>
     </div>
   </div>
-
   <script>
     async function fetchData() {
         const res = await fetch('/data');
         return await res.json();
     }
-
     async function fetchHistoricalData() {
         const res = await fetch('/historical-data');
         return await res.json();
     }
-
     // Initialize real-time charts
     const trafficCtx1 = document.getElementById('trafficChart1').getContext('2d');
     const trafficCtx2 = document.getElementById('trafficChart2').getContext('2d');
     const cpuCtx = document.getElementById('cpuChart').getContext('2d');
     const memCtx = document.getElementById('memChart').getContext('2d');
-
     // Initialize historical charts
     const historicalTrafficCtx1 = document.getElementById('historicalTrafficChart1').getContext('2d');
     const historicalTrafficCtx2 = document.getElementById('historicalTrafficChart2').getContext('2d');
     const historicalCpuCtx = document.getElementById('historicalCpuChart').getContext('2d');
     const historicalMemCtx = document.getElementById('historicalMemChart').getContext('2d');
-
     const chartOptions = {
         responsive: true,
         maintainAspectRatio: false,
@@ -353,7 +344,6 @@ app.get("/", (req, res) => {
             y: { beginAtZero: true }
         }
     };
-
     const trafficChartOptions = {
         ...chartOptions,
         plugins: {
@@ -366,7 +356,6 @@ app.get("/", (req, res) => {
             }
         }
     };
-
     // Real-time charts
     const trafficChart1 = new Chart(trafficCtx1, {
         type: 'line',
@@ -376,7 +365,6 @@ app.get("/", (req, res) => {
         ]},
         options: trafficChartOptions
     });
-
     const trafficChart2 = new Chart(trafficCtx2, {
         type: 'line',
         data: { labels: [], datasets: [
@@ -385,15 +373,16 @@ app.get("/", (req, res) => {
         ]},
         options: trafficChartOptions
     });
-
     const cpuChart = new Chart(cpuCtx, {
         type: 'line',
         data: { labels: [], datasets: [
-            { label: 'CPU %', data: [], borderColor: 'green', fill: false }
+            { label: 'CPU1 %', data: [], borderColor: 'green', fill: false },
+            { label: 'CPU2 %', data: [], borderColor: 'purple', fill: false },
+            { label: 'CPU3 %', data: [], borderColor: 'blue', fill: false },
+            { label: 'CPU4 %', data: [], borderColor: 'red', fill: false }
         ]},
         options: { ...chartOptions, scales: { ...chartOptions.scales, y: { beginAtZero: true, max: 100 } } }
     });
-
     const memChart = new Chart(memCtx, {
         type: 'line',
         data: { labels: [], datasets: [
@@ -401,7 +390,6 @@ app.get("/", (req, res) => {
         ]},
         options: chartOptions
     });
-
     // Historical charts
     const historicalTrafficChart1 = new Chart(historicalTrafficCtx1, {
         type: 'line',
@@ -411,7 +399,6 @@ app.get("/", (req, res) => {
         ]},
         options: trafficChartOptions
     });
-
     const historicalTrafficChart2 = new Chart(historicalTrafficCtx2, {
         type: 'line',
         data: { labels: [], datasets: [
@@ -420,15 +407,16 @@ app.get("/", (req, res) => {
         ]},
         options: trafficChartOptions
     });
-
     const historicalCpuChart = new Chart(historicalCpuCtx, {
         type: 'line',
         data: { labels: [], datasets: [
-            { label: 'CPU %', data: [], borderColor: 'green', fill: false }
+            { label: 'CPU1 %', data: [], borderColor: 'green', fill: false },
+            { label: 'CPU2 %', data: [], borderColor: 'purple', fill: false },
+            { label: 'CPU3 %', data: [], borderColor: 'blue', fill: false },
+            { label: 'CPU4 %', data: [], borderColor: 'red', fill: false }
         ]},
         options: { ...chartOptions, scales: { ...chartOptions.scales, y: { beginAtZero: true, max: 100 } } }
     });
-
     const historicalMemChart = new Chart(historicalMemCtx, {
         type: 'line',
         data: { labels: [], datasets: [
@@ -436,51 +424,48 @@ app.get("/", (req, res) => {
         ]},
         options: chartOptions
     });
-
     async function updateCharts() {
         try {
             const [realTimeData, historicalData] = await Promise.all([
                 fetchData(),
                 fetchHistoricalData()
             ]);
-
             // Update real-time charts
             trafficChart1.data.labels = realTimeData.times;
             trafficChart1.data.datasets[0].data = realTimeData.inTraffic1;
             trafficChart1.data.datasets[1].data = realTimeData.outTraffic1;
             trafficChart1.update();
-
             trafficChart2.data.labels = realTimeData.times;
             trafficChart2.data.datasets[0].data = realTimeData.inTraffic2;
             trafficChart2.data.datasets[1].data = realTimeData.outTraffic2;
             trafficChart2.update();
-
             cpuChart.data.labels = realTimeData.times;
-            cpuChart.data.datasets[0].data = realTimeData.cpuUsage;
+            cpuChart.data.datasets[0].data = realTimeData.cpuUsage1;
+            cpuChart.data.datasets[1].data = realTimeData.cpuUsage2;
+            cpuChart.data.datasets[2].data = realTimeData.cpuUsage3;
+            cpuChart.data.datasets[3].data = realTimeData.cpuUsage4;
             cpuChart.update();
-
             memChart.data.labels = realTimeData.times;
             memChart.data.datasets[0].data = realTimeData.memUsed;
             memChart.update();
-
             // Update historical charts
             if (historicalData && historicalData.length > 0) {
                 const labels = historicalData.map(item => item.timestamp);
-                
+               
                 historicalTrafficChart1.data.labels = labels;
                 historicalTrafficChart1.data.datasets[0].data = historicalData.map(item => item.in_traffic1);
                 historicalTrafficChart1.data.datasets[1].data = historicalData.map(item => item.out_traffic1);
                 historicalTrafficChart1.update();
-
                 historicalTrafficChart2.data.labels = labels;
                 historicalTrafficChart2.data.datasets[0].data = historicalData.map(item => item.in_traffic2);
                 historicalTrafficChart2.data.datasets[1].data = historicalData.map(item => item.out_traffic2);
                 historicalTrafficChart2.update();
-
                 historicalCpuChart.data.labels = labels;
-                historicalCpuChart.data.datasets[0].data = historicalData.map(item => item.cpu_usage);
+                historicalCpuChart.data.datasets[0].data = historicalData.map(item => item.cpu_usage1);
+                historicalCpuChart.data.datasets[1].data = historicalData.map(item => item.cpu_usage2);
+                historicalCpuChart.data.datasets[2].data = historicalData.map(item => item.cpu_usage3);
+                historicalCpuChart.data.datasets[3].data = historicalData.map(item => item.cpu_usage4);
                 historicalCpuChart.update();
-
                 historicalMemChart.data.labels = labels;
                 historicalMemChart.data.datasets[0].data = historicalData.map(item => item.mem_used);
                 historicalMemChart.update();
@@ -489,7 +474,6 @@ app.get("/", (req, res) => {
             console.error('Error updating charts:', error);
         }
     }
-
     setInterval(updateCharts, ${POLL_INTERVAL_SECONDS * 1000});
     updateCharts();
   </script>
@@ -497,7 +481,6 @@ app.get("/", (req, res) => {
 </html>
     `);
 });
-
 app.get("/data", (req, res) => {
     res.json({
         times,
@@ -505,11 +488,13 @@ app.get("/data", (req, res) => {
         outTraffic1,
         inTraffic2,
         outTraffic2,
-        cpuUsage,
+        cpuUsage1,
+        cpuUsage2,
+        cpuUsage3,
+        cpuUsage4,
         memUsed
     });
 });
-
 app.get("/historical-data", async (req, res) => {
     try {
         const limit = parseInt(req.query.limit) || 100;
@@ -520,7 +505,6 @@ app.get("/historical-data", async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch historical data' });
     }
 });
-
 // Start the application
 startApplication().then(() => {
     const PORT = 8000;
