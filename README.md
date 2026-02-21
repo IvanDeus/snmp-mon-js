@@ -50,7 +50,7 @@ A simple SNMP monitoring solution that collects real-time metrics and stores his
    
    For development:
    ```bash
-   npm start
+   node monitor.js
    ```
    
    For production (with PM2):
