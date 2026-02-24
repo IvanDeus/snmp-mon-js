@@ -148,8 +148,9 @@ snmp-mon-js/
 3. Modify the database schema and saving logic
 4. Update the web interface charts
 
-2026 [ ivan deus ]
-
 ---
 
 **Enjoy monitoring your network!**
+
+
+2026 [ ivan deus ]
