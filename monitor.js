@@ -413,7 +413,7 @@ app.get("/", (req, res) => {
   </style>
 </head>
 <body>
-  <h1>SNMP Monitor - 16 CPU (0-15) Real-time & Historical Data</h1>
+  <h1>SNMP Monitor - 16 CPU (0-15) Real-time & Historical Data: ${SNMP_HOST}</h1>
 
   <div class="section-title">Real-time Data (Last ${MAX_DATA_POINTS} points)</div>
   <div class="chart-container">
